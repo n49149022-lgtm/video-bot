@@ -3,3 +3,4 @@ torch
 torchaudio
 python-telegram-bot
 numpy
+ffmpeg-python
