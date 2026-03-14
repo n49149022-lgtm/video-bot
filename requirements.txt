@@ -1,3 +1,4 @@
 requests
 torch
 torchaudio
+python-telegram-bot
