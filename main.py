@@ -4,37 +4,34 @@ import re
 import time
 import torch
 import subprocess
-import zipfile
+import tempfile
+import logging
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ================= КОНФИГУРАЦИЯ =================
-# Ключи (берутся из переменных окружения Bothost, но тут запасные)
+# ================= НАСТРОЙКИ =================
+# Токен берется из переменных окружения Bothost (автоматически)
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+# Ключи API
 GIGA_AUTH = os.getenv("GIGA_AUTH", "MDE5Y2VjM2YtMmNjOS03MzA4LWFiMjMtMjllMWU4NGU2MGU0Ojc5YWUzZTlmLTQ2MjMtNGRjYi1iMThkLWNhNWI4YThjY2FjMw==")
 PEXELS_KEY = os.getenv("PEXELS_KEY", "L3Reu5JdqAheWW3iPF7n1rxyMjl9NHD9mumI0DP4VNR4V10778ZWzEuL")
 PIXABAY_KEY = os.getenv("PIXABAY_KEY", "54311008-07504ce70c6812bf263f5a22d")
 
-# Папки
-WORK_DIR = "output_batch"
-VIDEO_DIR = os.path.join(WORK_DIR, "clips")
-AUDIO_DIR = os.path.join(WORK_DIR, "audio")
-os.makedirs(VIDEO_DIR, exist_ok=True)
-os.makedirs(AUDIO_DIR, exist_ok=True)
+# Папка для временных файлов
+WORK_DIR = "temp_videos"
+os.makedirs(WORK_DIR, exist_ok=True)
 
-# ================= СПИСОК ТЕМ (РЕДАКТИРУЙ ТУТ!) =================
-TOPICS = [
-    "Как нейросети меняют мир за 5 лет",
-    "Топ 3 ошибки новичков в программировании",
-    "Почему базы данных важнее кода",
-    "Будущее искусственного интеллекта в России",
-    "Секреты оптимизации SQL запросов"
-]
-# ================================================================
+# Флаг занятости
+IS_BUSY = False
 
-print(f"🚀 ЗАПУСК ФАБРИКИ ВИДЕО. Всего планов: {len(TOPICS)}")
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# --- ФУНКЦИИ (те же самые, что и раньше) ---
+# ================= ФУНКЦИИ ГЕНЕРАЦИИ (ТЕ ЖЕ САМЫЕ) =================
 
 def get_script(topic):
-    print(f"🧠 Генерация сценария: {topic}...")
+    logger.info(f"🧠 Генерация сценария: {topic}")
     url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {GIGA_AUTH}"}
     prompt = f"""
@@ -53,7 +50,7 @@ def get_script(topic):
         match = re.search(r'---SCRIPT_START---(.*?)---SCRIPT_END---', content, re.DOTALL)
         return match.group(1) if match else None
     except Exception as e:
-        print(f"❌ Ошибка GigaChat: {e}")
+        logger.error(f"❌ Ошибка GigaChat: {e}")
         return None
 
 def parse_scenes(text):
@@ -67,8 +64,8 @@ def parse_scenes(text):
             scenes.append({"text": t.group(1).strip(), "query": re.sub(r'[^\w\s]', '', v.group(1)).strip()})
     return scenes
 
-def download_video(query, idx, scene_folder):
-    path = os.path.join(scene_folder, f"v.mp4")
+def download_video(query, scene_folder):
+    path = os.path.join(scene_folder, "v.mp4")
     # Pexels
     try:
         r = requests.get("https://api.pexels.com/videos/search", headers={"Authorization": PEXELS_KEY}, params={"query": query, "per_page": 1, "orientation": "portrait"}, timeout=10)
@@ -89,9 +86,9 @@ def download_video(query, idx, scene_folder):
     return None
 
 def generate_audio(scenes, scene_folder):
-    print("   🗣 Озвучка (Silero)...")
+    logger.info("   🗣 Озвучка (Silero)...")
     try:
-        model, _ = torch.hub.load(repo_or_dir='snakers4/silero-models', model='silero_tts', language='ru', speaker='xenia', force_reload=True)
+        model, _ = torch.hub.load(repo_or_dir='snakers4/silero-models', model='silero_tts', language='ru', speaker='xenia', force_reload=False)
     except:
         model, _ = torch.hub.load(repo_or_dir='snakers4/silero-models', model='silero_tts', language='ru', speaker='xenia')
     
@@ -103,19 +100,19 @@ def generate_audio(scenes, scene_folder):
     return paths
 
 def assemble_video(scenes, audio_paths, scene_folder, output_filename):
-    # Создаем списки для ffmpeg
     v_list = os.path.join(scene_folder, "v_list.txt")
     a_list = os.path.join(scene_folder, "a_list.txt")
     
+    # Если видео не найдено, создаем заглушку
+    v_path = os.path.join(scene_folder, "v.mp4")
+    if not os.path.exists(v_path):
+        stub = os.path.join(scene_folder, "stub.mp4")
+        subprocess.run(f"ffmpeg -y -f lavfi -i color=c=black:s=1080x1920:d=5 -c:v libx264 -t 5 {stub}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        v_path = stub
+
     with open(v_list, "w") as f:
-        for i in range(len(scenes)):
-            fp = os.path.join(scene_folder, "v.mp4") # Упрощаем: одно видео на сцену не всегда найдется, берем одно общее или заглушку
-            # Для простоты массового генератора: если видео нет - черный экран
-            if os.path.exists(fp): f.write(f"file '{fp}'\n")
-            else:
-                stub = os.path.join(scene_folder, "stub.mp4")
-                subprocess.run(f"ffmpeg -y -f lavfi -i color=c=black:s=1080x1920:d=5 -c:v libx264 -t 5 {stub}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                f.write(f"file '{stub}'\n")
+        # Для простоты берем одно видео на весь ролик (или можно зациклить)
+        f.write(f"file '{v_path}'\n") 
     
     with open(a_list, "w") as f:
         for ap in audio_paths: f.write(f"file '{ap}'\n")
@@ -132,77 +129,114 @@ def assemble_video(scenes, audio_paths, scene_folder, output_filename):
     if not os.path.exists(mus_path):
         with open(mus_path, 'wb') as f: f.write(requests.get(mus_url).content)
 
-    final_path = os.path.join(WORK_DIR, output_filename)
+    final_path = os.path.join(scene_folder, output_filename)
     cmd = f'ffmpeg -y -i {temp_v} -i {temp_a} -i {mus_path} -filter_complex "[1:a]volume=1[v];[2:a]volume=0.1[m];[v][m]amix=inputs=2[a]" -map 0:v -map "[a]" -c:v copy -c:a aac -shortest "{final_path}"'
     subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
-    # Чистка временных файлов сцены
-    for f in os.listdir(scene_folder):
-        if f not in ["clips", "audio"]: # Не удаляем папки, только файлы внутри если надо, но тут мы удалим всю папку сцены потом
-            pass 
-    # Для экономии места можно удалить временные файлы сцены, но оставим для отладки пока
-    
-    print(f"   ✅ Сохранено: {output_filename}")
+    return final_path
 
-# ================= ГЛАВНЫЙ ЦИКЛ =================
-def main():
-    for i, topic in enumerate(TOPICS):
-        print(f"\n>>> ВИДЕО {i+1}/{len(TOPICS)}: {topic}")
-        
+# ================= ОБРАБОТЧИКИ КОМАНД TELEGRAM =================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 **Прометей Видео-Фабрика** запущена!\n\n"
+        "🎬 **Команды:**\n"
+        "/make <тема> — Создать видео (например: /make Нейросети)\n"
+        "/status — Проверить занятость бота\n\n"
+        "⏳ Генерация занимает 2-4 минуты. Я пришлю готовый файл сюда."
+    )
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global IS_BUSY
+    if IS_BUSY:
+        await update.message.reply_text("🔄 Бот сейчас занят генерацией другого видео. Подождите немного.")
+    else:
+        await update.message.reply_text("✅ Бот свободен и готов к работе!")
+
+async def make_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global IS_BUSY
+    
+    if IS_BUSY:
+        await update.message.reply_text("🔄 Я сейчас занят! Подождите, пока закончу предыдущее видео.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("❌ Укажите тему! Пример: /make Искусственный интеллект")
+        return
+
+    topic = " ".join(context.args)
+    IS_BUSY = True
+    
+    msg = await update.message.reply_text(f"🚀 **Запуск фабрики для темы:** {topic}\n\n⏳ Это займет пару минут...")
+    
+    try:
         # 1. Сценарий
         script = get_script(topic)
         if not script:
-            print("   ❌ Не удалось получить сценарий, пропускаем.")
-            continue
-        
+            await msg.edit_text("❌ Ошибка: Не удалось получить сценарий от GigaChat.")
+            IS_BUSY = False
+            return
+
         scenes = parse_scenes(script)
         if not scenes:
-            print("   ❌ Нет сцен, пропускаем.")
-            continue
-            
-        # 2. Папка для текущей сцены
-        scene_folder = os.path.join(WORK_DIR, f"scene_{i+1}")
-        os.makedirs(scene_folder, exist_ok=True)
-        
-        # 3. Видео (пытаемся найти хоть что-то, иначе будет черное)
-        # Для упрощения берем первый запрос и ищем видео, или можно искать для каждого кадра (долго)
-        # Сделаем компромисс: ищем видео по первому ключевому слову для всего ролика
-        first_query = scenes[0]['query']
-        v_path = download_video(first_query, 0, scene_folder)
-        if not v_path:
-            print("   ⚠️ Видео не найдено, будет черный фон.")
-        
-        # 4. Аудио
-        try:
-            audio_paths = generate_audio(scenes, scene_folder)
-        except Exception as e:
-            print(f"   ❌ Ошибка озвучки: {e}")
-            continue
-            
-        # 5. Сборка
-        safe_name = "".join(c for c in topic if c.isalnum() or c in (' ', '_')).rstrip()[:30]
-        out_file = f"video_{i+1}_{safe_name}.mp4"
-        assemble_video(scenes, audio_paths, scene_folder, out_file)
-        
-        # Очистка папки сцены для экономии места (опционально)
-        # import shutil
-        # shutil.rmtree(scene_folder) 
-        
-        time.sleep(2) # Пауза между видео
+            await msg.edit_text("❌ Ошибка: Не удалось разобрать сценарий.")
+            IS_BUSY = False
+            return
 
-    print("\n🎉 ВСЁ ГОТОВО! Проверь папку output_batch")
+        await msg.edit_text(f"📝 Сценарий готов ({len(scenes)} сцен). Скачиваю видео и озвучиваю...")
+
+        # 2. Подготовка папки
+        scene_folder = os.path.join(WORK_DIR, f"task_{update.message.message_id}")
+        os.makedirs(scene_folder, exist_ok=True)
+
+        # 3. Видео (берем первое ключевое слово для фона всего ролика для скорости)
+        first_query = scenes[0]['query']
+        v_path = download_video(first_query, scene_folder)
+        if not v_path:
+            logger.warning("Видео не найдено, будет черный фон.")
+
+        # 4. Аудио
+        audio_paths = generate_audio(scenes, scene_folder)
+
+        # 5. Сборка
+        await msg.edit_text("🎬 Монтирую финальное видео...")
+        out_file = "result.mp4"
+        final_path = assemble_video(scenes, audio_paths, scene_folder, out_file)
+
+        # 6. Отправка файла
+        await msg.edit_text("✅ Готово! Отправляю файл...")
+        
+        with open(final_path, 'rb') as video:
+            await update.message.reply_video(video, caption=f"🎬 **Готово!**\nТема: {topic}\n\n🔥 Создано Прометеем.", quote=True)
+        
+        await msg.delete() # Удаляем служебное сообщение
+
+    except Exception as e:
+        logger.error(f"Ошибка генерации: {e}")
+        await msg.edit_text(f"❌ Произошла ошибка: {str(e)}")
     
-    # Архивация
-    print("📦 Создаю ZIP архив...")
-    zip_name = "all_videos.zip"
-    with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        for root, dirs, files in os.walk(WORK_DIR):
-            for file in files:
-                if file.endswith(".mp4"):
-                    full_path = os.path.join(root, file)
-                    arcname = os.path.relpath(full_path, WORK_DIR)
-                    zipf.write(full_path, arcname)
-    print(f"✅ Архив готов: {zip_name} (можно скачать)")
+    finally:
+        IS_BUSY = False
+        # Очистка папки (опционально, чтобы не забивать диск)
+        # import shutil
+        # shutil.rmtree(scene_folder, ignore_errors=True)
+
+# ================= ЗАПУСК БОТА =================
+
+def main():
+    if not TOKEN:
+        logger.error("❌ TOKEN не найден! Проверьте переменные окружения.")
+        return
+
+    logger.info("🤖 Запуск бота...")
+    app = Application.builder().token(TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("make", make_video))
+    
+    logger.info("✅ Бот запущен и ожидает команды...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
