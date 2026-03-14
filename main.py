@@ -1,9 +1,21 @@
 import os
+import subprocess
+import sys
+
+# 🔥 ПРИНУДИТЕЛЬНАЯ УСТАНОВКА numpy ПРЯМО ПРИ ЗАПУСКЕ (ЧТОБЫ НЕ БЫЛО ОШИБОК) 🔥
+try:
+    import numpy
+except ImportError:
+    print("⚠️ NumPy не найден! Устанавливаю принудительно...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "numpy", "--quiet"])
+    import numpy
+    print("✅ NumPy успешно установлен!")
+
+# ОСТАЛЬНЫЕ ИМПОРТЫ
 import requests
 import re
 import time
 import torch
-import subprocess
 import base64
 import uuid
 import logging
